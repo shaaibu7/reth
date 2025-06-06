@@ -137,10 +137,14 @@ where
         .await?;
 
         // create pipeline
-        let network_client = ctx.components().network().fetch_client().await?;
+        let network_handle = ctx.components().network().clone();
+        let network_client = network_handle.fetch_client().await?;
         let (consensus_engine_tx, consensus_engine_rx) = unbounded_channel();
 
         let node_config = ctx.node_config();
+
+        // We always assume that node is syncing after a restart
+        network_handle.update_sync_state(SyncState::Syncing);
 
         let max_block = ctx.max_block(network_client.clone()).await?;
 
@@ -284,7 +288,6 @@ where
 
         // Run consensus engine to completion
         let initial_target = ctx.initial_backfill_target()?;
-        let network_handle = ctx.components().network().clone();
         let mut built_payloads = ctx
             .components()
             .payload_builder_handle()
@@ -307,9 +310,6 @@ where
             }
 
             let mut res = Ok(());
-
-            /// We always assume that node is syncing on the restart
-            network_handle.update_sync_state(SyncState::Syncing);
 
             // advance the chain and await payloads built locally to add into the engine api tree handler to prevent re-execution if that block is received as payload from the CL
             loop {
