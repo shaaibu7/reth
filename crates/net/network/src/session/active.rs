@@ -170,9 +170,9 @@ impl<N: NetworkPrimitives> ActiveSession<N> {
             ($resp:ident, $item:ident) => {{
                 let RequestPair { request_id, message } = $resp;
                 if let Some(req) = self.inflight_requests.remove(&request_id) {
-                    trace!(peer_id=?self.remote_peer_id, ?request_id, "received response from peer");
                     match req.request {
                         RequestState::Waiting(PeerRequest::$item { response, .. }) => {
+                            trace!(peer_id=?self.remote_peer_id, ?request_id, "received response from peer");
                             let _ = response.send(Ok(message));
                             self.update_request_timeout(req.timestamp, Instant::now());
                         }
