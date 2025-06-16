@@ -68,7 +68,7 @@ pub struct EngineArgs {
     pub precompile_cache_enabled: bool,
 
     /// Disable precompile cache
-    #[arg(long = "engine.disable-precompile-cache", default_value = "false")]
+    #[arg(long = "engine.disable-precompile-cache", default_value = "true")]
     pub precompile_cache_disabled: bool,
 
     /// Enable state root fallback, useful for testing
@@ -103,7 +103,7 @@ impl Default for EngineArgs {
             max_proof_task_concurrency: DEFAULT_MAX_PROOF_TASK_CONCURRENCY,
             reserved_cpu_cores: DEFAULT_RESERVED_CPU_CORES,
             precompile_cache_enabled: true,
-            precompile_cache_disabled: false,
+            precompile_cache_disabled: true,
             state_root_fallback: false,
             always_process_payload_attributes_on_canonical_head: false,
         }
