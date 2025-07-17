@@ -10,12 +10,13 @@ use reth_consensus::{ConsensusError, FullConsensus};
 use reth_engine_primitives::{PayloadValidationOutcome, PayloadValidator, TreeCtx};
 use reth_evm::{ConfigureEvm, SpecFor};
 use reth_payload_primitives::NewPayloadError;
-use reth_primitives_traits::{NodePrimitives, RecoveredBlock};
+use reth_primitives_traits::{AlloyBlockHeader, NodePrimitives, RecoveredBlock, SealedHeader};
 use reth_provider::{
-    BlockReader, ChainSpecProvider, DatabaseProviderFactory, StateCommitmentProvider,
-    StateProviderFactory, StateReader,
+    BlockReader, ChainSpecProvider, DatabaseProviderFactory, HeaderProvider,
+    StateCommitmentProvider, StateProviderFactory, StateReader,
 };
 use std::{collections::HashMap, marker::Unpin, sync::Arc};
+use tracing::{debug, trace};
 
 /// A concrete implementation of the `PayloadValidator` trait that handles validation,
 /// execution, and state root computation.
@@ -91,6 +92,7 @@ where
         + StateReader
         + StateCommitmentProvider
         + ChainSpecProvider
+        + HeaderProvider<Header = N::BlockHeader>
         + Clone
         + Unpin
         + 'static,
@@ -119,9 +121,41 @@ where
 
     fn validate_block(
         &self,
-        _block: &RecoveredBlock<Self::Block>,
-        _ctx: TreeCtx<'_, EngineApiTreeState<N>>,
+        block: &RecoveredBlock<Self::Block>,
+        ctx: TreeCtx<'_, EngineApiTreeState<N>>,
     ) -> Result<(), ConsensusError> {
+        let block_num_hash = block.num_hash();
+        debug!(target: "engine::tree", block=?block_num_hash, parent = ?block.header().parent_hash(), "Validating downloaded block");
+
+        // Validate block consensus rules
+        trace!(target: "engine::tree", block=?block_num_hash, "Validating block header");
+        self.consensus.validate_header(block.sealed_header())?;
+
+        trace!(target: "engine::tree", block=?block_num_hash, "Validating block pre-execution");
+        self.consensus.validate_block_pre_execution(block)?;
+
+        // Get parent header for validation
+        let parent_hash = block.header().parent_hash();
+        let parent_header =
+            if let Some(parent_block) = ctx.state.tree_state.executed_block_by_hash(parent_hash) {
+                parent_block.block.recovered_block.sealed_header().clone()
+            } else {
+                // Fallback to database if not in tree state
+                let header: N::BlockHeader = self
+                    .provider
+                    .header(&parent_hash)
+                    .map_err(|e| ConsensusError::Other(e.to_string()))?
+                    .ok_or_else(|| {
+                        ConsensusError::Other(format!("Parent header not found: {parent_hash}"))
+                    })?;
+                SealedHeader::seal_slow(header)
+            };
+
+        // Validate against parent
+        trace!(target: "engine::tree", block=?block_num_hash, "Validating block against parent");
+        self.consensus.validate_header_against_parent(block.sealed_header(), &parent_header)?;
+
+        debug!(target: "engine::tree", block=?block_num_hash, "Block validation complete");
         Ok(())
     }
 }
