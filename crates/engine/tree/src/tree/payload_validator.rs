@@ -5,12 +5,15 @@ use crate::tree::{
     precompile_cache::{CachedPrecompileMetrics, PrecompileCacheMap},
     EngineApiTreeState, TreeConfig,
 };
+use alloy_eips::eip2718::Decodable2718;
 use alloy_rpc_types_engine::ExecutionData;
 use reth_consensus::{ConsensusError, FullConsensus};
 use reth_engine_primitives::{PayloadValidationOutcome, PayloadValidator, TreeCtx};
 use reth_evm::{ConfigureEvm, SpecFor};
 use reth_payload_primitives::NewPayloadError;
-use reth_primitives_traits::{AlloyBlockHeader, NodePrimitives, RecoveredBlock, SealedHeader};
+use reth_primitives_traits::{
+    AlloyBlockHeader, Block, BlockBody, NodePrimitives, RecoveredBlock, SealedHeader,
+};
 use reth_provider::{
     BlockReader, ChainSpecProvider, DatabaseProviderFactory, HeaderProvider,
     StateCommitmentProvider, StateProviderFactory, StateReader,
@@ -81,11 +84,54 @@ where
             precompile_cache_metrics: HashMap::new(),
         }
     }
+
+    /// Converts an execution payload to a recovered block.
+    fn payload_to_block(
+        &self,
+        payload: ExecutionData,
+    ) -> Result<RecoveredBlock<N::Block>, NewPayloadError>
+    where
+        N::Block: Block<Body: BlockBody<Transaction = N::SignedTx>>
+            + From<alloy_consensus::Block<N::SignedTx>>,
+        N::SignedTx: Decodable2718,
+    {
+        let ExecutionData { payload, sidecar } = payload;
+
+        let expected_hash = payload.block_hash();
+
+        // Parse the block from the payload
+        let alloy_block: alloy_consensus::Block<N::SignedTx> =
+            payload.try_into_block_with_sidecar(&sidecar).map_err(NewPayloadError::Eth)?;
+
+        // Convert to N::Block
+        let block: N::Block = alloy_block.into();
+
+        // Seal the block
+        let sealed_block = block.seal_slow();
+
+        // Ensure the hash included in the payload matches the block hash
+        if expected_hash != sealed_block.hash() {
+            return Err(NewPayloadError::Eth(alloy_rpc_types_engine::PayloadError::BlockHash {
+                execution: sealed_block.hash(),
+                consensus: expected_hash,
+            }));
+        }
+
+        // Recover senders for the block
+        let recovered_block = sealed_block
+            .try_recover()
+            .map_err(|_| NewPayloadError::Other("Failed to recover senders".to_string().into()))?;
+
+        Ok(recovered_block)
+    }
 }
 
 impl<N, P, C> PayloadValidator<EngineApiTreeState<N>> for TreePayloadValidator<N, P, C>
 where
     N: NodePrimitives,
+    N::Block: Block<Body: BlockBody<Transaction = N::SignedTx>>
+        + From<alloy_consensus::Block<N::SignedTx>>,
+    N::SignedTx: Decodable2718,
     P: DatabaseProviderFactory<Provider: BlockReader>
         + BlockReader
         + StateProviderFactory
@@ -111,11 +157,19 @@ where
     fn validate_payload(
         &self,
         payload: Self::ExecutionData,
-        _ctx: TreeCtx<'_, EngineApiTreeState<N>>,
+        ctx: TreeCtx<'_, EngineApiTreeState<N>>,
     ) -> Result<PayloadValidationOutcome<Self::Block>, NewPayloadError> {
-        match self.ensure_well_formed_payload(payload) {
-            Ok(block) => Ok(PayloadValidationOutcome::Valid { block }),
-            Err(error) => Err(error),
+        // First, convert the payload to a block
+        let block = self.payload_to_block(payload)?;
+
+        // Then validate the block using the validate_block method
+        match self.validate_block(&block, ctx) {
+            Ok(()) => Ok(PayloadValidationOutcome::Valid { block }),
+            Err(error) => {
+                // Convert consensus error to payload error
+                let payload_error = NewPayloadError::Other(Box::new(error));
+                Ok(PayloadValidationOutcome::Invalid { block, error: payload_error })
+            }
         }
     }
 
