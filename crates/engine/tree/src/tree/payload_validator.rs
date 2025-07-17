@@ -2,10 +2,11 @@
 
 use crate::tree::{
     payload_processor::PayloadProcessor,
-    precompile_cache::{CachedPrecompileMetrics, PrecompileCacheMap},
-    EngineApiTreeState, TreeConfig,
+    precompile_cache::{CachedPrecompile, CachedPrecompileMetrics, PrecompileCacheMap},
+    EngineApiMetrics, EngineApiTreeState, StateProviderDatabase, TreeConfig,
 };
 use alloy_eips::eip2718::Decodable2718;
+use alloy_evm::{block::BlockExecutor, Evm};
 use alloy_rpc_types_engine::ExecutionData;
 use reth_consensus::{ConsensusError, FullConsensus};
 use reth_engine_primitives::{PayloadValidationOutcome, PayloadValidator, TreeCtx};
@@ -15,17 +16,23 @@ use reth_primitives_traits::{
     AlloyBlockHeader, Block, BlockBody, NodePrimitives, RecoveredBlock, SealedHeader,
 };
 use reth_provider::{
-    BlockReader, ChainSpecProvider, DatabaseProviderFactory, HeaderProvider,
-    StateCommitmentProvider, StateProviderFactory, StateReader,
+    BlockExecutionOutput, BlockReader, ChainSpecProvider, DatabaseProviderFactory, HeaderProvider,
+    StateCommitmentProvider, StateProvider, StateProviderFactory, StateReader,
 };
-use std::{collections::HashMap, marker::Unpin, sync::Arc};
+use reth_revm::db::State;
+use std::{
+    collections::HashMap,
+    marker::Unpin,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 use tracing::{debug, trace};
 
 /// A concrete implementation of the `PayloadValidator` trait that handles validation,
 /// execution, and state root computation.
 #[derive(Debug)]
 #[allow(dead_code)]
-pub struct TreePayloadValidator<N, P, C>
+pub(crate) struct TreePayloadValidator<N, P, C>
 where
     N: NodePrimitives,
     P: BlockReader
@@ -48,11 +55,21 @@ where
     /// Payload processor for state root computation.
     payload_processor: PayloadProcessor<N, C>,
     /// Precompile cache map.
-    precompile_cache_map: PrecompileCacheMap<SpecFor<C>>,
+    /// Uses Mutex for interior mutability since `cache_for_address` requires &mut self
+    precompile_cache_map: Mutex<PrecompileCacheMap<SpecFor<C>>>,
     /// Precompile cache metrics.
-    precompile_cache_metrics: HashMap<alloy_primitives::Address, CachedPrecompileMetrics>,
+    ///
+    /// We use `Mutex` here for interior mutability because:
+    /// 1. The `PayloadValidator` trait requires `&self` (not `&mut self`) to support Arc<dyn
+    ///    PayloadValidator>
+    /// 2. The trait has `Send + Sync` bounds, so we need thread-safe interior mutability
+    /// 3. We need to update metrics during block execution in `execute_block`
+    precompile_cache_metrics: Mutex<HashMap<alloy_primitives::Address, CachedPrecompileMetrics>>,
+    /// Metrics for the engine api.
+    metrics: EngineApiMetrics,
 }
 
+#[allow(dead_code)]
 impl<N, P, C> TreePayloadValidator<N, P, C>
 where
     N: NodePrimitives,
@@ -66,13 +83,14 @@ where
     C: ConfigureEvm<Primitives = N> + 'static,
 {
     /// Creates a new `TreePayloadValidator`.
-    pub fn new(
+    pub(crate) fn new(
         provider: P,
         consensus: Arc<dyn FullConsensus<N, Error = ConsensusError>>,
         evm_config: C,
         config: TreeConfig,
         payload_processor: PayloadProcessor<N, C>,
         precompile_cache_map: PrecompileCacheMap<SpecFor<C>>,
+        metrics: EngineApiMetrics,
     ) -> Self {
         Self {
             provider,
@@ -80,8 +98,9 @@ where
             evm_config,
             config,
             payload_processor,
-            precompile_cache_map,
-            precompile_cache_metrics: HashMap::new(),
+            precompile_cache_map: Mutex::new(precompile_cache_map),
+            precompile_cache_metrics: Mutex::new(HashMap::new()),
+            metrics,
         }
     }
 
@@ -124,6 +143,61 @@ where
 
         Ok(recovered_block)
     }
+
+    /// Executes the given block using the provided state provider.
+    fn execute_block<S: StateProvider>(
+        &self,
+        state_provider: S,
+        block: &RecoveredBlock<N::Block>,
+    ) -> Result<(BlockExecutionOutput<N::Receipt>, Instant), NewPayloadError>
+    where
+        N::Block: Block<Body: BlockBody<Transaction = N::SignedTx>>,
+    {
+        trace!(target: "engine::tree", block = ?block.num_hash(), "Executing block");
+
+        // Create state database
+        let mut db = State::builder()
+            .with_database(StateProviderDatabase::new(state_provider))
+            .with_bundle_update()
+            .without_state_clear()
+            .build();
+
+        // Configure executor for the block
+        let mut executor = self.evm_config.executor_for_block(&mut db, block);
+
+        // Configure precompile caching if enabled
+        if !self.config.precompile_cache_disabled() {
+            // Get the spec id before the closure
+            let spec_id = *self.evm_config.evm_env(block.header()).spec_id();
+
+            // Lock both the cache map and metrics map for the duration of precompile setup
+            let mut cache_map = self.precompile_cache_map.lock().unwrap();
+            let mut metrics_map = self.precompile_cache_metrics.lock().unwrap();
+
+            executor.evm_mut().precompiles_mut().map_precompiles(|address, precompile| {
+                let metrics = metrics_map
+                    .entry(*address)
+                    .or_insert_with(|| CachedPrecompileMetrics::new_with_address(*address))
+                    .clone();
+                let cache = cache_map.cache_for_address(*address);
+                CachedPrecompile::wrap(precompile, cache, spec_id, Some(metrics))
+            });
+        }
+
+        // Execute the block
+        let start = Instant::now();
+        let output = self
+            .metrics
+            .executor
+            .execute_metered(
+                executor,
+                block,
+                Box::new(|_source, _state: &_| {}), // Empty state hook for now
+            )
+            .map_err(|e| NewPayloadError::Other(Box::new(e)))?;
+
+        Ok((output, start))
+    }
 }
 
 impl<N, P, C> PayloadValidator<EngineApiTreeState<N>> for TreePayloadValidator<N, P, C>
@@ -163,14 +237,38 @@ where
         let block = self.payload_to_block(payload)?;
 
         // Then validate the block using the validate_block method
-        match self.validate_block(&block, ctx) {
-            Ok(()) => Ok(PayloadValidationOutcome::Valid { block }),
-            Err(error) => {
-                // Convert consensus error to payload error
-                let payload_error = NewPayloadError::Other(Box::new(error));
-                Ok(PayloadValidationOutcome::Invalid { block, error: payload_error })
-            }
+        if let Err(error) = self.validate_block(&block, ctx) {
+            let payload_error = NewPayloadError::Other(Box::new(error));
+            return Ok(PayloadValidationOutcome::Invalid { block, error: payload_error });
         }
+
+        // Get the parent block's state to execute against
+        let parent_hash = block.header().parent_hash();
+        let state_provider = match self.provider.history_by_block_hash(parent_hash) {
+            Ok(provider) => provider,
+            Err(e) => {
+                let error = NewPayloadError::Other(Box::new(e));
+                return Ok(PayloadValidationOutcome::Invalid { block, error });
+            }
+        };
+
+        // Execute the block
+        let (output, _execution_time) = match self.execute_block(state_provider, &block) {
+            Ok(result) => result,
+            Err(error) => {
+                return Ok(PayloadValidationOutcome::Invalid { block, error });
+            }
+        };
+
+        // Perform post-execution validation
+        if let Err(err) = self.consensus.validate_block_post_execution(&block, &output) {
+            let error = NewPayloadError::Other(Box::new(err));
+            return Ok(PayloadValidationOutcome::Invalid { block, error });
+        }
+
+        // TODO: Add state root computation and verification here in the next phase
+
+        Ok(PayloadValidationOutcome::Valid { block })
     }
 
     fn validate_block(
