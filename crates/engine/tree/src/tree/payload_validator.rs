@@ -60,8 +60,8 @@ where
     /// Precompile cache metrics.
     ///
     /// We use `Mutex` here for interior mutability because:
-    /// 1. The `PayloadValidator` trait requires `&self` (not `&mut self`) to support Arc<dyn
-    ///    PayloadValidator>
+    /// 1. The `PayloadValidator` trait requires `&self` (not `&mut self`) to support `Arc<dyn
+    ///    PayloadValidator>`
     /// 2. The trait has `Send + Sync` bounds, so we need thread-safe interior mutability
     /// 3. We need to update metrics during block execution in `execute_block`
     precompile_cache_metrics: Mutex<HashMap<alloy_primitives::Address, CachedPrecompileMetrics>>,
